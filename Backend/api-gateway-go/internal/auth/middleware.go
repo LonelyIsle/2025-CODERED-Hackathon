@@ -4,7 +4,7 @@ import (
 	"context"
 	"net/http"
 
-	"codered/api-gateway-go/internal/cache"
+	"github.com/LonelyIsle/2025-CODERED-Hackathon/Backend/api-gateway-go/internal/cache"
 )
 
 func RequireAuth(next http.Handler) http.Handler {

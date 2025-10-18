@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"codered/api-gateway-go/internal/clients"
+	"github.com/LonelyIsle/2025-CODERED-Hackathon/Backend/api-gateway-go/internal/clients"
 )
 
 type ReportRequest struct {
