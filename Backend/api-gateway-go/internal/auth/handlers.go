@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"codered/api-gateway-go/internal/cache"
-	"codered/api-gateway-go/internal/db"
+	"github.com/LonelyIsle/2025-CODERED-Hackathon/Backend/api-gateway-go/internal/cache"
+	"github.com/LonelyIsle/2025-CODERED-Hackathon/Backend/api-gateway-go/internal/db"
 )
 
 func Login(w http.ResponseWriter, r *http.Request) {
