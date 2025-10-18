@@ -43,17 +43,24 @@ func main() {
 	// ==============================================
 	r.Post("/api/auth/login", auth.Login)
 	r.Post("/api/auth/logout", auth.Logout)
-	r.Get("/api/auth/me", auth.RequireAuth(http.HandlerFunc(auth.Me)))
+	r.Get("/api/auth/me", func(w http.ResponseWriter, req *http.Request) {
+		// RequireAuth returns http.Handler; adapt to HandlerFunc
+		auth.RequireAuth(http.HandlerFunc(auth.Me)).ServeHTTP(w, req)
+	})
 
 	// ==============================================
 	// 📊 Report routes
 	// ==============================================
-	r.Post("/api/report", auth.RequireAuth(http.HandlerFunc(handlers.GenerateReport)))
+	r.Post("/api/report", func(w http.ResponseWriter, req *http.Request) {
+		auth.RequireAuth(http.HandlerFunc(handlers.GenerateReport)).ServeHTTP(w, req)
+	})
 
 	// ==============================================
 	// 🧰 Admin routes
 	// ==============================================
-	r.Get("/api/admin", auth.RequireAuth(http.HandlerFunc(handlers.AdminDashboard)))
+	r.Get("/api/admin", func(w http.ResponseWriter, req *http.Request) {
+		auth.RequireAuth(http.HandlerFunc(handlers.AdminDashboard)).ServeHTTP(w, req)
+	})
 
 	// ==============================================
 	// 🌐 Serve static frontend (optional)
