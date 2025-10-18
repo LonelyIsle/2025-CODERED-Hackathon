@@ -1,67 +1,71 @@
 use anyhow::Result;
-use deadpool_postgres::{Config as DpConfig, ManagerConfig, RecyclingMethod, Pool, Runtime};
-use postgres_native_tls::MakeTlsConnector;
-use tokio_postgres::NoTls; // kept for possible future use
+use deadpool_postgres::{Config as PgConfig, Pool, Runtime};
+use tokio_postgres::NoTls;
+
 use crate::types::Document;
 
 pub type PgPool = Pool;
 
 pub async fn init_pool(pg_url: &str) -> Result<PgPool> {
-    let mut cfg = DpConfig::new();
+    let mut cfg = PgConfig::new();
     cfg.url = Some(pg_url.to_string());
-    cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
 
-    // TLS (safe to use even for local sslmode=disable; server decides)
-    let tls_connector = native_tls::TlsConnector::builder().build()?;
-    let tls = MakeTlsConnector::new(tls_connector);
-
-    let pool = cfg.create_pool(Some(Runtime::Tokio1), tls)?;
+    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
+    ensure_table(&pool).await?;
     Ok(pool)
 }
 
-pub async fn upsert_document(pool: &PgPool, doc: &Document) -> Result<()> {
-    let client = pool.get().await?;
-
-    // Ensure table (idempotent, low-traffic path; for prod, use migrations)
-    client.batch_execute(
-        "CREATE TABLE IF NOT EXISTS documents (
-            url TEXT PRIMARY KEY,
-            fetched_at TIMESTAMPTZ NOT NULL,
-            title TEXT,
-            description TEXT,
-            body_text TEXT NOT NULL,
-            content_type TEXT,
-            http_status INT NOT NULL
-        );"
-    ).await?;
-
-    // Upsert
-    let q = r#"
-        INSERT INTO documents
-            (url, fetched_at, title, description, body_text, content_type, http_status)
-        VALUES
-            ($1,  $2,        $3,    $4,         $5,        $6,           $7)
-        ON CONFLICT (url) DO UPDATE SET
-            fetched_at = EXCLUDED.fetched_at,
-            title = EXCLUDED.title,
-            description = EXCLUDED.description,
-            body_text = EXCLUDED.body_text,
-            content_type = EXCLUDED.content_type,
-            http_status = EXCLUDED.http_status
+async fn ensure_table(pool: &PgPool) -> Result<()> {
+    // Safe to run on every boot
+    const SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS public.ingested_documents (
+      id            bigserial PRIMARY KEY,
+      url           text NOT NULL,
+      fetched_at    timestamptz NOT NULL,
+      title         text,
+      description   text,
+      body_text     text NOT NULL,
+      content_type  text,
+      http_status   int NOT NULL,
+      created_at    timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_url ON public.ingested_documents (url);
+    CREATE INDEX IF NOT EXISTS idx_ingested_fetched_at ON public.ingested_documents (fetched_at DESC);
     "#;
 
-    client.execute(
-        q,
-        &[
-            &doc.url,
-            &doc.fetched_at,
-            &doc.title,
-            &doc.description,
-            &doc.body_text,
-            &doc.content_type,
-            &doc.http_status,
-        ],
-    ).await?;
+    let conn = pool.get().await?;
+    conn.batch_execute(SQL).await?;
+    Ok(())
+}
 
+pub async fn upsert_document(pool: &PgPool, d: &Document) -> Result<()> {
+    // Upsert into the *ingested_documents* table (NOT public.documents)
+    const SQL: &str = r#"
+    INSERT INTO public.ingested_documents
+      (url, fetched_at, title, description, body_text, content_type, http_status)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    ON CONFLICT (url) DO UPDATE
+      SET fetched_at   = EXCLUDED.fetched_at,
+          title        = EXCLUDED.title,
+          description  = EXCLUDED.description,
+          body_text    = EXCLUDED.body_text,
+          content_type = EXCLUDED.content_type,
+          http_status  = EXCLUDED.http_status;
+    "#;
+
+    let conn = pool.get().await?;
+    conn.execute(
+        SQL,
+        &[
+            &d.url,
+            &d.fetched_at,
+            &d.title,
+            &d.description,
+            &d.body_text,
+            &d.content_type,
+            &d.http_status,
+        ],
+    )
+    .await?;
     Ok(())
 }
