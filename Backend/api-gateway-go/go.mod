@@ -1,4 +1,5 @@
-module codered/api-gateway-go
+module github.com/LonelyIsle/2025-CODERED-Hackathon/Backend/api-gateway-go
+
 
 go 1.22
 
