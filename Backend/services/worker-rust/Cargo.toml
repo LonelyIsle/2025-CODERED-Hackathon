@@ -9,7 +9,7 @@ actix-rt = "2.9.0"
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "signal"] }
 reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "deflate", "cookies", "rustls-tls"] }
 scraper = "0.19"
-robots_txt = "0.8"     # <-- correct crate name
+robots_txt = "0.7"     # <-- correct crate name
 url = "2.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
