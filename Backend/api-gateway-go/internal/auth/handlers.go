@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"crypto/rand"   
 	"context"
 	"encoding/json"
 	"net/http"
