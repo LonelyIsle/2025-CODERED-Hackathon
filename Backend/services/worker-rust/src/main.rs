@@ -2,13 +2,14 @@ use actix_web::{middleware, post, get, web, App, HttpResponse, HttpServer, Respo
 use std::time::{Duration, Instant};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt::Subscriber};
+use tracing_subscriber::util::SubscriberInitExt; // <- for `.init()`
 
 mod scrape;
 mod store;
 mod types;
 
 use crate::scrape::{ScrapeClient, scrape_one};
-use crate::store::{PgPool, init_pool};
+use crate::store::{PgPool, init_pool, upsert_document};
 use crate::types::{IngestRequest, Health};
 
 #[get("/health")]
@@ -25,10 +26,9 @@ async fn ingest_url(
     let started = Instant::now();
     let req = payload.into_inner();
 
-    let result = scrape_one(&sc, &req.url).await;
-    match result {
+    match scrape_one(&sc, &req.url).await {
         Ok(doc) => {
-            if let Err(e) = store::upsert_document(&pg, &doc).await {
+            if let Err(e) = upsert_document(&pg, &doc).await {
                 error!(error = ?e, "failed to store document");
                 return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                     "ok": false, "error": "store_failed"
@@ -53,7 +53,7 @@ async fn ingest_url(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // ---- Logging (RUST_LOG=info by default) ----
+    // ---- Logging (RUST_LOG=info default) ----
     if std::env::var_os("RUST_LOG").is_none() {
         std::env::set_var("RUST_LOG", "info");
     }
