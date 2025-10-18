@@ -1,19 +1,20 @@
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
-use reqwest::{Client, redirect::Policy};
+use chrono::Utc;
+use reqwest::{redirect::Policy, Client};
 use robots_txt::RobotsTxt;
 use scraper::{Html, Selector};
-use std::{time::Duration, collections::HashMap};
-use url::Url;
-use chrono::Utc;
-use crate::types::Document;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
+use url::Url;
+
+use crate::types::Document;
 
 #[derive(Clone)]
 pub struct ScrapeClient {
-    http: Client,
-    user_agent: String,
+    pub(crate) http: Client,
+    pub(crate) user_agent: String,
     // simple polite throttling
     domain_limit: Arc<Semaphore>,
     delay: Duration,
@@ -40,8 +41,13 @@ impl ScrapeClient {
     }
 
     pub async fn fetch_bytes(&self, url: &Url) -> Result<(reqwest::StatusCode, String, Bytes)> {
-        let _permit = self.domain_limit.acquire().await?;
-        // simple fixed delay to be polite
+        // Limit concurrency + add a small delay to be polite
+        let _permit = self
+            .domain_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("semaphore closed"))?;
         tokio::time::sleep(self.delay).await;
 
         let res = self.http.get(url.clone()).send().await?;
@@ -57,32 +63,26 @@ impl ScrapeClient {
     }
 }
 
-fn allowed_by_robots(sc: &ScrapeClient, url: &Url) -> bool {
+async fn allowed_by_robots(sc: &ScrapeClient, url: &Url) -> bool {
     let robots_url = match url.join("/robots.txt") {
         Ok(u) => u,
         Err(_) => return true, // be permissive if malformed join
     };
 
-    // blocking fetch: we’ll do a small async block-on with reqwest (already async)
-    // but we want to swallow errors and allow by default if robots is missing/unavailable
-    // NOTE: some sites rate-limit robots. Use a short timeout via client configuration above.
-    let fut = sc.http.get(robots_url.clone()).send();
     let ua = sc.user_agent.clone();
-    let robots_txt = futures::executor::block_on(async {
-        match fut.await {
-            Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
-            _ => None,
-        }
-    });
-
-    if let Some(txt) = robots_txt {
-        if let Ok(robots) = RobotsTxt::parse(&txt) {
-            return robots
-                .allowed(url.as_str(), &ua)
-                .unwrap_or(true);
-        }
+    match sc.http.get(robots_url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(txt) => {
+                if let Ok(robots) = RobotsTxt::parse(&txt) {
+                    robots.allowed(url.as_str(), &ua).unwrap_or(true)
+                } else {
+                    true
+                }
+            }
+            _ => true,
+        },
+        _ => true,
     }
-    true
 }
 
 /// Strip scripts/styles and turn visible text into a single string.
@@ -91,26 +91,25 @@ fn html_to_text(html: &str) -> (Option<String>, Option<String>, String) {
 
     // Title
     let title_sel = Selector::parse("title").unwrap();
-    let title = doc.select(&title_sel).next().map(|n| n.text().collect::<String>().trim().to_string()).filter(|s| !s.is_empty());
+    let title = doc
+        .select(&title_sel)
+        .next()
+        .map(|n| n.text().collect::<String>().trim().to_string())
+        .filter(|s| !s.is_empty());
 
     // Meta description
     let meta_sel = Selector::parse("meta[name=description]").unwrap();
-    let description = doc.select(&meta_sel).next()
+    let description = doc
+        .select(&meta_sel)
+        .next()
         .and_then(|m| m.value().attr("content"))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Visible text: drop scripts/styles/noscript
-    let remove_sel = Selector::parse("script,style,noscript").unwrap();
-    let mut doc_mut = doc.clone();
-    for n in doc_mut.select(&remove_sel) {
-        // no DOM mutation API; we’ll just ignore them by extracting from original doc
-        let _ = n; // noop
-    }
-
-    // Gather text from body
+    // Gather visible text from body (scripts/styles/noscript ignored by not selecting them)
     let body_sel = Selector::parse("body").unwrap();
-    let body_text = doc.select(&body_sel)
+    let body_text = doc
+        .select(&body_sel)
         .flat_map(|b| b.text())
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
@@ -126,7 +125,7 @@ pub async fn scrape_one(sc: &ScrapeClient, url_raw: &str) -> Result<Document> {
         bail!("unsupported scheme");
     }
 
-    if !allowed_by_robots(sc, &url) {
+    if !allowed_by_robots(sc, &url).await {
         bail!("blocked by robots.txt");
     }
 
