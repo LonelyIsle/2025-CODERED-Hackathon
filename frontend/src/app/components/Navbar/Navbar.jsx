@@ -11,6 +11,7 @@ export default function Navbar(){
                 <a href="/about" className="text-gray-600 hover:text-gray-800 mx-4">About</a>
                 <a href="/adminPanel" className="text-gray-600 hover:text-gray-800 mx-4">Admin Panel</a>
                 <a href="/reviews" className="text-gray-600 hover:text-gray-800 mx-4">Reviews</a>
+                <a href="/login" className="text-gray-600 hover:text-gray-800 mx-4">Login</a>
             </div>
         </nav>
     </>
