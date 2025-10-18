@@ -1,5 +1,4 @@
 use actix_web::{middleware, post, get, web, App, HttpResponse, HttpServer, Responder};
-use serde::Deserialize;
 use std::time::{Duration, Instant};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt::Subscriber};
@@ -54,23 +53,30 @@ async fn ingest_url(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Logging
-    let _ = Subscriber::builder()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+    // ---- Logging (RUST_LOG=info by default) ----
+    if std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+    Subscriber::builder()
+        .with_env_filter(EnvFilter::from_default_env())
         .finish()
-        .try_init();
+        .init();
 
-    // Config from env
+    // ---- Config from env ----
     let addr = std::env::var("WORKER_BIND").unwrap_or_else(|_| "127.0.0.1:5002".to_string());
     let pg_url = std::env::var("PG_URL").expect("PG_URL not set");
 
-    // Init subsystems
+    // ---- Init subsystems ----
     let pool = init_pool(&pg_url).await.expect("pg pool init failed");
     info!("✅ connected to Postgres");
 
-    let sc = ScrapeClient::new("ClimateImpactBot/1.0 (+https://codered.plobethus.com)", 2, Duration::from_millis(400));
+    let sc = ScrapeClient::new(
+        "ClimateImpactBot/1.0 (+https://codered.plobethus.com)",
+        2,                          // concurrent per domain
+        Duration::from_millis(400), // politeness delay
+    );
 
-    info!("🌐 worker listening on {}", addr);
+    info!("🌐 worker listening on {}", &addr);
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(pool.clone()))
