@@ -17,58 +17,67 @@ import (
 )
 
 func main() {
-	// Load .env one directory up if present; fall back to process env
-	_ = loadDotEnv("../.env")
+	_ = loadDotEnv("../.env") // load Backend/.env if present
 
-	// Init subsystems
 	if err := db.Init(); err != nil {
 		log.Fatalf("db init: %v", err)
 	}
 	cache.Init(os.Getenv("VALKEY_ADDR"), mustAtoiEnv("VALKEY_DB", 0))
 
-	// Router
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
-	r.Use(security.CSRFMiddleware)
-	r.Use(security.RateLimitMiddleware(120, time.Minute)) // 120 req per minute per IP
+	r.Use(security.CSRFMiddleware)                      // double-submit cookie unless DISABLE_CSRF=true
+	r.Use(security.RateLimitMiddleware(120, time.Minute)) // 120 req/min per IP
 
-	// Health / ping
+	// health
 	r.Get("/api/ping", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true,"pong":true}`))
 	})
 
-	// Auth
+	// CSRF token endpoint (double submit cookie)
+	r.Get("/api/auth/csrf", func(w http.ResponseWriter, r *http.Request) {
+		token := security.IssueCSRFToken(w)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"token":"` + token + `"}`))
+	})
+
+	// auth
 	r.Post("/api/auth/login", auth.Login)
 	r.Post("/api/auth/logout", auth.Logout)
-	r.Get("/api/auth/me", func(w http.ResponseWriter, r *http.Request) {
-		auth.RequireAuth(http.HandlerFunc(auth.Me)).ServeHTTP(w, r)
+	r.Get("/api/auth/me", func(w http.ResponseWriter, req *http.Request) {
+		auth.RequireAuth(http.HandlerFunc(auth.Me)).ServeHTTP(w, req)
 	})
 
-	// Reports / Admin
-	r.Post("/api/report", func(w http.ResponseWriter, r *http.Request) {
-		auth.RequireAuth(http.HandlerFunc(handlers.GenerateReport)).ServeHTTP(w, r)
+	// reports/admin
+	r.Post("/api/report", func(w http.ResponseWriter, req *http.Request) {
+		auth.RequireAuth(http.HandlerFunc(handlers.GenerateReport)).ServeHTTP(w, req)
 	})
-	r.Get("/api/admin", func(w http.ResponseWriter, r *http.Request) {
-		auth.RequireAuth(http.HandlerFunc(handlers.AdminDashboard)).ServeHTTP(w, r)
+	r.Get("/api/admin", func(w http.ResponseWriter, req *http.Request) {
+		auth.RequireAuth(http.HandlerFunc(handlers.AdminDashboard)).ServeHTTP(w, req)
 	})
 
-	// Static frontend (optional)
+	// worker proxy: scrape/ingest
+	r.Post("/api/ingest/url", func(w http.ResponseWriter, req *http.Request) {
+		auth.RequireAuth(http.HandlerFunc(handlers.IngestURL)).ServeHTTP(w, req)
+	})
+
+	// AI endpoints (optional)
+	r.Post("/api/ai/chat", handlers.ChatHandler)
+	r.Post("/api/ai/embed", handlers.EmbedHandler)
+
+	// static frontend (optional)
 	r.Handle("/*", http.FileServer(http.Dir("./web")))
 
 	port := os.Getenv("API_PORT")
-	if port == "" {
-		port = "8080"
-	}
+	if port == "" { port = "8080" }
 	log.Printf("🌍 API Gateway running on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, r))
 }
 
 func mustAtoiEnv(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
-		if n, err := atoi(v); err == nil {
-			return n
-		}
+		if n, err := atoi(v); err == nil { return n }
 	}
 	return def
 }
@@ -76,36 +85,23 @@ func mustAtoiEnv(key string, def int) int {
 func atoi(s string) (int, error) {
 	var n, sign int = 0, 1
 	for i, r := range s {
-		if i == 0 && r == '-' {
-			sign = -1
-			continue
-		}
-		if r < '0' || r > '9' {
-			return 0, &atoiErr{s}
-		}
+		if i == 0 && r == '-' { sign = -1; continue }
+		if r < '0' || r > '9' { return 0, &atoiErr{s} }
 		n = n*10 + int(r-'0')
 	}
 	return sign * n, nil
 }
-
 type atoiErr struct{ s string }
 func (e *atoiErr) Error() string { return "invalid int: " + e.s }
 
-// loadDotEnv is a tiny inline loader to avoid extra deps.
-// It only supports KEY=VALUE per line, ignores blanks and # comments.
+// lightweight .env loader (KEY=VALUE lines, ignores comments)
 func loadDotEnv(path string) error {
 	b, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 	for _, line := range splitLines(string(b)) {
-		if line == "" || line[0] == '#' {
-			continue
-		}
+		if line == "" || line[0] == '#' { continue }
 		kv := splitOnce(line, '=')
-		if len(kv) != 2 {
-			continue
-		}
+		if len(kv) != 2 { continue }
 		if os.Getenv(kv[0]) == "" {
 			_ = os.Setenv(kv[0], kv[1])
 		}
@@ -117,22 +113,16 @@ func splitLines(s string) []string {
 	start := 0
 	for i, r := range s {
 		if r == '\n' || r == '\r' {
-			if i > start {
-				out = append(out, s[start:i])
-			}
+			if i > start { out = append(out, s[start:i]) }
 			start = i + 1
 		}
 	}
-	if start < len(s) {
-		out = append(out, s[start:])
-	}
+	if start < len(s) { out = append(out, s[start:]) }
 	return out
 }
 func splitOnce(s string, sep rune) []string {
 	for i, r := range s {
-		if r == sep {
-			return []string{s[:i], s[i+1:]}
-		}
+		if r == sep { return []string{s[:i], s[i+1:]} }
 	}
 	return []string{s}
 }

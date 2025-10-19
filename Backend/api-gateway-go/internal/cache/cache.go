@@ -13,13 +13,8 @@ var (
 )
 
 func Init(addr string, db int) {
-	if addr == "" {
-		addr = "127.0.0.1:6379"
-	}
-	rdb = redis.NewClient(&redis.Options{
-		Addr: addr,
-		DB:   db,
-	})
+	if addr == "" { addr = "127.0.0.1:6379" }
+	rdb = redis.NewClient(&redis.Options{ Addr: addr, DB: db })
 }
 
 func Set(key, val string, ttl time.Duration) error {
