@@ -1,12 +1,12 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct IngestRequest {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct Health {
     pub status: String,
 }
@@ -20,4 +20,8 @@ pub struct Document {
     pub body_text: String,
     pub content_type: Option<String>,
     pub http_status: i32,
+    pub lang: Option<String>,
+    pub content_hash: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
 }
