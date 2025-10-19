@@ -55,12 +55,21 @@ r.Get("/api/auth/csrf", security.IssueCSRFToken)
 
 	// worker proxy: scrape/ingest
 	r.Post("/api/ingest/url", func(w http.ResponseWriter, req *http.Request) {
+r.Post("/api/admin/backfill", func(w http.ResponseWriter, req *http.Request) { auth.RequireAuth(http.HandlerFunc(handlers.Backfill)).ServeHTTP(w, req) })
 		auth.RequireAuth(http.HandlerFunc(handlers.IngestURL)).ServeHTTP(w, req)
 	})
 
 	// AI endpoints (optional)
-	r.Post("/api/ai/chat", handlers.ChatHandler)
-	r.Post("/api/ai/embed", handlers.EmbedHandler)
+if os.Getenv("DISABLE_AI") != "true" {
+    r.Post("/api/ai/chat", handlers.ChatHandler)
+    r.Post("/api/ai/embed", handlers.EmbedHandler)
+    r.Post("/api/search", handlers.Search)
+}	
+	r.Post("/api/search", handlers.Search)
+r.Post("/api/admin/backfill", func(w http.ResponseWriter, req *http.Request) {
+    auth.RequireAuth(http.HandlerFunc(handlers.Backfill)).ServeHTTP(w, req)
+})
+
 
 	// static frontend (optional)
 	r.Handle("/*", http.FileServer(http.Dir("./web")))
