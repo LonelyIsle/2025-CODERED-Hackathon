@@ -1,23 +1,23 @@
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
-use reqwest::{redirect::Policy, Client, StatusCode};
-use robots_txt::Robots;
-use scraper::{Html, Selector};
-use std::{collections::HashSet, time::Duration};
-use url::{Position, Url};
 use chrono::Utc;
-
-use crate::types::Document;
+use reqwest::{redirect::Policy, Client, StatusCode};
+use scraper::{Html, Selector};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
+use url::Url;
 
 #[derive(Clone)]
 pub struct ScrapeClient {
     pub http: Client,
     pub user_agent: String,
-    // simple per-request delay can be added externally if you like
+    // polite throttling
+    domain_limit: Arc<Semaphore>,
+    delay: Duration,
 }
 
 impl ScrapeClient {
-    pub fn new(user_agent: &str) -> Self {
+    pub fn new(user_agent: &str, concurrent_per_domain: usize, delay: Duration) -> Self {
         let http = Client::builder()
             .user_agent(user_agent)
             .gzip(true)
@@ -31,10 +31,15 @@ impl ScrapeClient {
         Self {
             http,
             user_agent: user_agent.to_string(),
+            domain_limit: Arc::new(Semaphore::new(concurrent_per_domain)),
+            delay,
         }
     }
 
     pub async fn fetch_bytes(&self, url: &Url) -> Result<(StatusCode, String, Bytes)> {
+        let _permit = self.domain_limit.acquire().await?;
+        tokio::time::sleep(self.delay).await;
+
         let res = self.http.get(url.clone()).send().await?;
         let status = res.status();
         let ct = res
@@ -48,87 +53,118 @@ impl ScrapeClient {
     }
 }
 
+/// Minimal robots.txt check:
+/// - fetches /robots.txt (if present)
+/// - chooses the first matching User-agent group (exact UA substring match, else `*`)
+/// - applies Disallow prefixes (Allow with longer prefix overrides)
 async fn allowed_by_robots(sc: &ScrapeClient, url: &Url) -> bool {
-    // robots.txt URL
-    let robots_url = match url.join("/robots.txt") {
-        Ok(u) => u,
-        Err(_) => return true, // malformed join, allow
-    };
+    // Build robots.txt URL (http[s]://host[:port]/robots.txt)
+    let mut robots = url.clone();
+    robots.set_path("/robots.txt");
+    robots.set_query(None);
+    robots.set_fragment(None);
 
-    // Get robots quickly; allow on error
-    let txt = match sc.http.get(robots_url).send().await {
+    let txt = match sc.http.get(robots).send().await {
         Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
         _ => None,
     };
+    let txt = match txt {
+        Some(t) => t,
+        None => return true, // no robots -> allow
+    };
 
-    if let Some(txt) = txt {
-        // parse lossily (crate 0.7 API)
-        let robots = Robots::from_str_lossy(&txt);
-        // robots_txt uses lowercase agent matching; use '*'
-        let ua = "*";
-        robots.allowed(ua, url.as_str()).unwrap_or(true)
-    } else {
-        true
+    #[derive(Default)]
+    struct Group {
+        uas: Vec<String>,
+        disallow: Vec<String>,
+        allow: Vec<String>,
     }
-}
 
-/// Extract <a href> absolute same-host links, deduped, limited.
-pub fn extract_links(html: &str, base: &Url, limit: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::<String>::new();
+    // Parse into groups
+    let mut groups: Vec<Group> = Vec::new();
+    let mut current = Group::default();
+    let mut saw = false;
 
-    let doc = Html::parse_document(html);
-    let a_sel = Selector::parse("a[href]").unwrap();
+    for raw in txt.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let mut parts = line.splitn(2, ':');
+        let k = parts.next().unwrap().trim().to_ascii_lowercase();
+        let v = parts.next().unwrap_or("").trim().to_string();
 
-    for a in doc.select(&a_sel) {
-        if let Some(href) = a.value().attr("href") {
-            if let Ok(abs) = base.join(href) {
-                // keep http(s) only
-                if abs.scheme() != "http" && abs.scheme() != "https" {
-                    continue;
+        match k.as_str() {
+            "user-agent" => {
+                if saw && (!current.uas.is_empty() || !current.disallow.is_empty() || !current.allow.is_empty()) {
+                    groups.push(current);
+                    current = Group::default();
                 }
-                // same host only to keep things polite
-                if abs.host_str() != base.host_str() {
-                    continue;
-                }
-                // strip fragment
-                let mut u = abs.clone();
-                u.set_fragment(None);
+                current.uas.push(v.to_ascii_lowercase());
+                saw = true;
+            }
+            "disallow" => { current.disallow.push(v); saw = true; }
+            "allow" => { current.allow.push(v); saw = true; }
+            _ => {}
+        }
+    }
+    if saw { groups.push(current); }
 
-                // normalize path+query as key
-                let key = u[..Position::AfterPath].to_string() + &u[Position::BeforeQuery..].to_string();
-                if seen.insert(key) {
-                    out.push(u.to_string());
-                    if out.len() >= limit {
-                        break;
-                    }
-                }
+    // Choose group: exact UA substring match, else `*`
+    let ua_lc = sc.user_agent.to_ascii_lowercase();
+    let mut chosen: Option<&Group> = None;
+
+    for g in &groups {
+        if g.uas.iter().any(|u| !u.is_empty() && ua_lc.contains(u)) {
+            chosen = Some(g);
+            break;
+        }
+    }
+    if chosen.is_none() {
+        for g in &groups {
+            if g.uas.iter().any(|u| u == "*") {
+                chosen = Some(g);
+                break;
             }
         }
     }
-    out
+    let g = match chosen { Some(g) => g, None => return true };
+
+    let path = url.path();
+    // Disallow prefix blocks unless an Allow with a longer prefix overrides.
+    for d in &g.disallow {
+        if d.is_empty() { continue; }
+        if path.starts_with(d) {
+            let override_ok = g.allow.iter().any(|a| !a.is_empty() && path.starts_with(a) && a.len() > d.len());
+            if !override_ok { return false; }
+        }
+    }
+    true
 }
 
-/// Strip scripts/styles and turn visible text into one string, plus title/description.
+/// Extract (title, description, body text) from HTML.
 fn html_to_text(html: &str) -> (Option<String>, Option<String>, String) {
     let doc = Html::parse_document(html);
 
-    // title
+    // Title
     let title_sel = Selector::parse("title").unwrap();
-    let title = doc.select(&title_sel).next()
+    let title = doc
+        .select(&title_sel)
+        .next()
         .map(|n| n.text().collect::<String>().trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // meta description
+    // Meta description
     let meta_sel = Selector::parse("meta[name=description]").unwrap();
-    let description = doc.select(&meta_sel).next()
+    let description = doc
+        .select(&meta_sel)
+        .next()
         .and_then(|m| m.value().attr("content"))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // gather body text
+    // Visible text from <body>
     let body_sel = Selector::parse("body").unwrap();
-    let body_text = doc.select(&body_sel)
+    let body_text = doc
+        .select(&body_sel)
         .flat_map(|b| b.text())
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
@@ -138,7 +174,9 @@ fn html_to_text(html: &str) -> (Option<String>, Option<String>, String) {
     (title, description, body_text)
 }
 
-pub async fn scrape_one(sc: &ScrapeClient, url_raw: &str) -> Result<(Document, String, Vec<String>)> {
+use crate::types::Document;
+
+pub async fn scrape_one(sc: &ScrapeClient, url_raw: &str) -> Result<Document> {
     let url = Url::parse(url_raw).map_err(|e| anyhow!("bad url: {e}"))?;
     if !(url.scheme() == "https" || url.scheme() == "http") {
         bail!("unsupported scheme");
@@ -153,21 +191,15 @@ pub async fn scrape_one(sc: &ScrapeClient, url_raw: &str) -> Result<(Document, S
         bail!("http status {}", status.as_u16());
     }
 
-    // Only HTML for now
     if !ct.to_lowercase().starts_with("text/html") {
         bail!("content-type not html: {ct}");
     }
 
-    // Decode bytes (assume utf-8)
     let html = String::from_utf8_lossy(&body).to_string();
     let (title, description, text) = html_to_text(&html);
-
-    // Discover a few internal links to enqueue
-    let discovered = extract_links(&html, &url, 50);
-
     let trimmed = text.chars().take(200_000).collect::<String>();
 
-    let doc = Document {
+    Ok(Document {
         url: url.to_string(),
         fetched_at: Utc::now(),
         title,
@@ -175,11 +207,5 @@ pub async fn scrape_one(sc: &ScrapeClient, url_raw: &str) -> Result<(Document, S
         body_text: trimmed,
         content_type: Some(ct),
         http_status: status.as_u16() as i32,
-        lang: None,
-        content_hash: None,
-        etag: None,
-        last_modified: None,
-    };
-
-    Ok((doc, url.to_string(), discovered))
+    })
 }
