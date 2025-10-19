@@ -8,7 +8,7 @@ mod store;
 mod types;
 
 use crate::scrape::{ScrapeClient, scrape_one};
-use crate::store::{Pool, init_pool};
+use crate::store::{PgPool, init_pool};
 use crate::types::{IngestRequest, Health};
 
 #[get("/health")]
@@ -19,14 +19,14 @@ async fn health() -> impl Responder {
 #[post("/ingest/url")]
 async fn ingest_url(
     payload: web::Json<IngestRequest>,
-    pg: web::Data<Pool>,
+    pg: web::Data<PgPool>,
     sc: web::Data<ScrapeClient>,
 ) -> actix_web::Result<impl Responder> {
     let req = payload.into_inner();
 
-    match scrape_one(&sc, &req.url).await {
+    match scrape_one(sc.get_ref(), &req.url).await {
         Ok(doc) => {
-            if let Err(e) = store::upsert_document(&pg, &doc).await {
+            if let Err(e) = store::upsert_document(pg.get_ref(), &doc).await {
                 error!(error = ?e, "failed to store document");
                 return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                     "ok": false, "error": "store_failed"
@@ -63,6 +63,11 @@ async fn main() -> std::io::Result<()> {
     // Init subsystems
     let pool = init_pool(&pg_url).await.expect("pg pool init failed");
     info!("✅ connected to Postgres");
+
+    // (Optional) ensure tables exist
+    if let Err(e) = store::ensure_tables(&pool).await {
+        eprintln!("warning: failed to ensure tables: {e}");
+    }
 
     // polite concurrency: 2 per domain, 400ms delay
     let sc = ScrapeClient::new(

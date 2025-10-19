@@ -40,7 +40,7 @@ impl ScrapeClient {
         }
     }
 
-    pub async fn fetch_bytes(&self, url: &Url) -> Result<(StatusCode, String, Option<String>, Bytes)> {
+    pub async fn fetch_bytes(&self, url: &Url) -> Result<(StatusCode, String, Option<String>, Option<String>, Bytes)> {
         let _permit = self.domain_limit.acquire().await?;
         tokio::time::sleep(self.delay).await;
 
@@ -60,8 +60,14 @@ impl ScrapeClient {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
+        let last_modified = res
+            .headers()
+            .get(header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
         let body = res.bytes().await?;
-        Ok((status, ct, etag, body))
+        Ok((status, ct, etag, last_modified, body))
     }
 }
 
@@ -75,124 +81,55 @@ async fn allowed_by_robots(sc: &ScrapeClient, url: &Url) -> bool {
     robots_url.set_query(None);
     robots_url.set_fragment(None);
 
-    let txt = match sc.http.get(robots_url).send().await {
-        Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
-        _ => None,
-    };
-    let txt = match txt {
-        Some(t) => t,
-        None => return true,
+    let text = match sc.http.get(robots_url).send().await {
+        Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
+        _ => return true, // if robots missing/unreadable, allow by default
     };
 
-    #[derive(Default)]
-    struct Group {
-        uas: Vec<String>,
-        disallow: Vec<String>,
-        allow: Vec<String>,
-    }
-
-    // Parse simple robots format
-    let mut groups = Vec::<Group>::new();
-    let mut current = Group::default();
-    let mut saw_any = false;
-
-    for raw in txt.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+    // Naive parse: collect allow/disallow rules
+    let mut allows: Vec<String> = Vec::new();
+    let mut disallows: Vec<String> = Vec::new();
+    let ua_l = sc.user_agent.to_lowercase();
+    let mut in_group = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let lower = line.to_lowercase();
+        if let Some(rest) = lower.strip_prefix("user-agent:") {
+            let agent = rest.trim();
+            in_group = agent == "*" || ua_l.contains(agent);
             continue;
         }
-        let mut parts = line.splitn(2, ':');
-        let key = parts.next().unwrap().trim().to_ascii_lowercase();
-        let val = parts.next().unwrap_or("").trim().to_string();
-
-        match key.as_str() {
-            "user-agent" => {
-                if saw_any && (!current.uas.is_empty() || !current.disallow.is_empty() || !current.allow.is_empty()) {
-                    groups.push(current);
-                    current = Group::default();
-                }
-                current.uas.push(val.to_ascii_lowercase());
-                saw_any = true;
-            }
-            "disallow" => {
-                current.disallow.push(val);
-                saw_any = true;
-            }
-            "allow" => {
-                current.allow.push(val);
-                saw_any = true;
-            }
-            _ => {}
+        if !in_group { continue; }
+        if let Some(path) = lower.strip_prefix("allow:") {
+            allows.push(path.trim().to_string());
+        } else if let Some(path) = lower.strip_prefix("disallow:") {
+            disallows.push(path.trim().to_string());
         }
     }
-    if saw_any {
-        groups.push(current);
-    }
 
-    // Select group
-    let ua_lc = sc.user_agent.to_ascii_lowercase();
-    let mut chosen: Option<&Group> = None;
-
-    for g in &groups {
-        if g.uas.iter().any(|u| !u.is_empty() && ua_lc.contains(u)) {
-            chosen = Some(g);
-            break;
-        }
-    }
-    if chosen.is_none() {
-        for g in &groups {
-            if g.uas.iter().any(|u| u == "*") {
-                chosen = Some(g);
-                break;
-            }
-        }
-    }
-    let g = match chosen {
-        Some(g) => g,
-        None => return true,
-    };
-
-    let path = url.path();
-
-    for d in &g.disallow {
-        if d.is_empty() {
-            continue;
-        }
-        if path.starts_with(d) {
-            let override_ok = g
-                .allow
-                .iter()
-                .any(|a| !a.is_empty() && path.starts_with(a) && a.len() > d.len());
-            if !override_ok {
-                return false;
-            }
-        }
-    }
-    true
+    let p = url.path();
+    // Blocked if a disallow matches and no longer allow overrides
+    let blocked = disallows.iter().any(|d| p.starts_with(d)) &&
+                  !allows.iter().any(|a| p.starts_with(a) && a.len() > 0);
+    !blocked
 }
 
-/// Extract (title, description, body text) from HTML.
 fn html_to_text(html: &str) -> (Option<String>, Option<String>, String) {
     let doc = Html::parse_document(html);
 
-    // <title>
+    // Title
     let title_sel = Selector::parse("title").unwrap();
-    let title = doc
-        .select(&title_sel)
-        .next()
-        .map(|n| n.text().collect::<String>().trim().to_string())
-        .filter(|s| !s.is_empty());
+    let title = doc.select(&title_sel).next().map(|n| n.text().collect::<String>().trim().to_string()).filter(|s| !s.is_empty());
 
-    // <meta name="description">
-    let meta_sel = Selector::parse("meta[name=description]").unwrap();
-    let description = doc
-        .select(&meta_sel)
-        .next()
-        .and_then(|m| m.value().attr("content"))
+    // Meta description
+    let meta_desc_sel = Selector::parse("meta[name=\"description\"]").unwrap();
+    let description = doc.select(&meta_desc_sel).next()
+        .and_then(|n| n.value().attr("content"))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Visible text from <body>
+    // Body visible text (simple heuristic)
     let body_sel = Selector::parse("body").unwrap();
     let body_text = doc
         .select(&body_sel)
@@ -215,7 +152,7 @@ pub async fn scrape_one(sc: &ScrapeClient, url_raw: &str) -> Result<Document> {
         bail!("blocked by robots.txt");
     }
 
-    let (status, ct, etag, body) = sc.fetch_bytes(&url).await?;
+    let (status, ct, etag, last_modified, body) = sc.fetch_bytes(&url).await?;
     if !status.is_success() {
         bail!("http status {}", status.as_u16());
     }
@@ -249,5 +186,6 @@ pub async fn scrape_one(sc: &ScrapeClient, url_raw: &str) -> Result<Document> {
         content_hash: Some(hash_hex),
         etag,
         lang,
+        last_modified,
     })
 }

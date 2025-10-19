@@ -13,10 +13,13 @@ pub struct Document {
     pub content_type: Option<String>,
     pub http_status: i32,
 
-    // Extra metadata (not required by DB schema; store.rs can ignore)
+    // Extra metadata
     pub content_hash: Option<String>,
     pub etag: Option<String>,
     pub lang: Option<String>,
+
+    // Added to align with DB schema
+    pub last_modified: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
