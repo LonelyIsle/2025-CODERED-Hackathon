@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -9,7 +8,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/joho/godotenv"
 
 	"github.com/LonelyIsle/2025-CODERED-Hackathon/Backend/api-gateway-go/internal/auth"
 	"github.com/LonelyIsle/2025-CODERED-Hackathon/Backend/api-gateway-go/internal/cache"
@@ -18,118 +16,123 @@ import (
 	"github.com/LonelyIsle/2025-CODERED-Hackathon/Backend/api-gateway-go/internal/security"
 )
 
-// --- CSRF helpers (public endpoint) ------------------------------------------------------
-
-func newCSRFToken() string {
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, 32)
-	for i := range b {
-		b[i] = letters[time.Now().UnixNano()%int64(len(letters))]
-	}
-	return string(b)
-}
-
-func csrfHandler(w http.ResponseWriter, r *http.Request) {
-	token := newCSRFToken()
-	http.SetCookie(w, &http.Cookie{
-		Name:     "csrf",
-		Value:    token,
-		Path:     "/",
-		HttpOnly: false, // frontend JS must echo it in X-CSRF-Token
-		SameSite: http.SameSiteLaxMode,
-		Secure:   false, // set true when served behind HTTPS
-	})
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"csrf": token})
-}
-
-// --- tiny sanity route -------------------------------------------------------------------
-
-func pingHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("pong"))
-}
-
 func main() {
-	// Load env (works when running from api-gateway-go or repo root)
-	_ = godotenv.Load(".env")
-	_ = godotenv.Load("../.env") // fallback if binary runs from /api-gateway-go
+	// Load .env one directory up if present; fall back to process env
+	_ = loadDotEnv("../.env")
 
-	// init subsystems
-	db.Init()
-	cache.Init()
+	// Init subsystems
+	if err := db.Init(); err != nil {
+		log.Fatalf("db init: %v", err)
+	}
+	cache.Init(os.Getenv("VALKEY_ADDR"), mustAtoiEnv("VALKEY_DB", 0))
 
+	// Router
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
+	r.Use(security.CSRFMiddleware)
+	r.Use(security.RateLimitMiddleware(120, time.Minute)) // 120 req per minute per IP
 
-// ---------- Public routes (NO CSRF) ----------
-r.Route("/api/auth", func(pub chi.Router) {
-    pub.Get("/csrf", csrfHandler)
-})
+	// Health / ping
+	r.Get("/api/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true,"pong":true}`))
+	})
 
-// ---------- Protected API (CSRF + rate limit) ----------
-r.Route("/api", func(api chi.Router) {
-    // Allow turning off CSRF locally: export DISABLE_CSRF=true
-    if os.Getenv("DISABLE_CSRF") != "true" {
-        api.Use(security.CSRFMiddleware)
-    }
-    api.Use(security.RateLimitMiddleware)
+	// Auth
+	r.Post("/api/auth/login", auth.Login)
+	r.Post("/api/auth/logout", auth.Logout)
+	r.Get("/api/auth/me", func(w http.ResponseWriter, r *http.Request) {
+		auth.RequireAuth(http.HandlerFunc(auth.Me)).ServeHTTP(w, r)
+	})
 
-    // health/ping
-    api.Get("/ping", pingHandler)
+	// Reports / Admin
+	r.Post("/api/report", func(w http.ResponseWriter, r *http.Request) {
+		auth.RequireAuth(http.HandlerFunc(handlers.GenerateReport)).ServeHTTP(w, r)
+	})
+	r.Get("/api/admin", func(w http.ResponseWriter, r *http.Request) {
+		auth.RequireAuth(http.HandlerFunc(handlers.AdminDashboard)).ServeHTTP(w, r)
+	})
 
-    // Auth-only endpoints
-    api.Route("/auth", func(a chi.Router) {
-        a.Post("/login", auth.Login)   // expects X-CSRF-Token + csrf cookie
-        a.Post("/logout", auth.Logout)
-        a.Get("/me", func(w http.ResponseWriter, req *http.Request) {
-            auth.RequireAuth(http.HandlerFunc(auth.Me)).ServeHTTP(w, req)
-        })
-    })
-
-    // AI endpoints (protect or not—your call; here they’re protected)
-    api.Post("/ai/chat", func(w http.ResponseWriter, req *http.Request) {
-        auth.RequireAuth(http.HandlerFunc(handlers.ChatHandler)).ServeHTTP(w, req)
-    })
-    api.Post("/ai/embed", func(w http.ResponseWriter, req *http.Request) {
-        auth.RequireAuth(http.HandlerFunc(handlers.EmbedHandler)).ServeHTTP(w, req)
-    })
-
-    // Reports/Admin
-    api.Post("/report", func(w http.ResponseWriter, req *http.Request) {
-        auth.RequireAuth(http.HandlerFunc(handlers.GenerateReport)).ServeHTTP(w, req)
-    })
-    api.Get("/admin", func(w http.ResponseWriter, req *http.Request) {
-        auth.RequireAuth(http.HandlerFunc(handlers.AdminDashboard)).ServeHTTP(w, req)
-    })
-    api.Post("/admin/ingest", func(w http.ResponseWriter, req *http.Request) {
-        auth.RequireAuth(http.HandlerFunc(handlers.IngestURL)).ServeHTTP(w, req)
-    })
-})
-
-	// (Optional) static fallback if you ever serve frontend from the Go binary.
-	// Nginx is serving your dist already, so you can remove this if unused.
-	// r.Handle("/*", http.FileServer(http.Dir("./web")))
+	// Static frontend (optional)
+	r.Handle("/*", http.FileServer(http.Dir("./web")))
 
 	port := os.Getenv("API_PORT")
 	if port == "" {
-		port = "8081"
+		port = "8080"
 	}
-
-	// 👉 Dump all routes on startup so you can verify /api/auth/login exists
-    if err := chi.Walk(r, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
-        log.Printf("route %-6s %s", method, route)
-        return nil
-    }); err != nil {
-        log.Printf("chi.Walk error: %v", err)
-    }
-
 	log.Printf("🌍 API Gateway running on :%s", port)
-	if err := http.ListenAndServe(":"+port, r); err != nil {
-		log.Fatalf("❌ Failed to start server: %v", err)
+	log.Fatal(http.ListenAndServe(":"+port, r))
+}
 
+func mustAtoiEnv(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := atoi(v); err == nil {
+			return n
+		}
 	}
+	return def
+}
+
+func atoi(s string) (int, error) {
+	var n, sign int = 0, 1
+	for i, r := range s {
+		if i == 0 && r == '-' {
+			sign = -1
+			continue
+		}
+		if r < '0' || r > '9' {
+			return 0, &atoiErr{s}
+		}
+		n = n*10 + int(r-'0')
+	}
+	return sign * n, nil
+}
+
+type atoiErr struct{ s string }
+func (e *atoiErr) Error() string { return "invalid int: " + e.s }
+
+// loadDotEnv is a tiny inline loader to avoid extra deps.
+// It only supports KEY=VALUE per line, ignores blanks and # comments.
+func loadDotEnv(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	for _, line := range splitLines(string(b)) {
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		kv := splitOnce(line, '=')
+		if len(kv) != 2 {
+			continue
+		}
+		if os.Getenv(kv[0]) == "" {
+			_ = os.Setenv(kv[0], kv[1])
+		}
+	}
+	return nil
+}
+func splitLines(s string) []string {
+	out := []string{}
+	start := 0
+	for i, r := range s {
+		if r == '\n' || r == '\r' {
+			if i > start {
+				out = append(out, s[start:i])
+			}
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		out = append(out, s[start:])
+	}
+	return out
+}
+func splitOnce(s string, sep rune) []string {
+	for i, r := range s {
+		if r == sep {
+			return []string{s[:i], s[i+1:]}
+		}
+	}
+	return []string{s}
 }

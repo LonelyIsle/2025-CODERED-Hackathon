@@ -2,49 +2,100 @@ package auth
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
-	"strings"
+	"errors"
+	"os"
+	"strconv"
 
 	"golang.org/x/crypto/argon2"
 )
 
-// HashPassword returns "saltB64$hashB64" using Argon2id with params:
-// iterations=1, memory=64MB, parallelism=4, keyLen=32.
-func HashPassword(password string) string {
-	salt := make([]byte, 16)
-	_, _ = rand.Read(salt) // ignore error for now; extremely unlikely to fail
-
-	hash := argon2.IDKey([]byte(password), salt, 1, 64*1024, 4, 32)
-
-	return base64.StdEncoding.EncodeToString(salt) + "$" + base64.StdEncoding.EncodeToString(hash)
+type argonParams struct {
+	Memory      uint32
+	Iterations  uint32
+	Parallelism uint8
+	KeyLen      uint32
 }
 
-// VerifyPassword supports two storage formats:
-//
-// 1) Argon2id "saltB64$hashB64"  -> recompute and constant-time compare the raw bytes.
-// 2) Plaintext (no "$")          -> accepted for dev/bootstrap; not recommended for production.
-func VerifyPassword(password, stored string) bool {
-	// If it looks like an Argon2id value, verify with Argon2id.
-	if strings.Contains(stored, "$") {
-		parts := strings.SplitN(stored, "$", 2)
-		if len(parts) != 2 {
-			return false
+func envU32(key string, def uint32) uint32 {
+	if s := os.Getenv(key); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 32); err == nil {
+			return uint32(v)
 		}
-
-		salt, err := base64.StdEncoding.DecodeString(parts[0])
-		if err != nil {
-			return false
-		}
-		wantHash, err := base64.StdEncoding.DecodeString(parts[1])
-		if err != nil {
-			return false
-		}
-
-		gotHash := argon2.IDKey([]byte(password), salt, 1, 64*1024, 4, 32)
-		return subtle.ConstantTimeCompare(gotHash, wantHash) == 1
 	}
+	return def
+}
 
-	// Otherwise, treat the stored value as plaintext (constant-time compare).
-	return subtle.ConstantTimeCompare([]byte(password), []byte(stored)) == 1
+func paramsFromEnv() argonParams {
+	return argonParams{
+		Memory:      envU32("PASSWORD_HASH_MEMORY_KB", 64*1024),
+		Iterations:  envU32("PASSWORD_HASH_ITERATIONS", 1),
+		Parallelism: uint8(envU32("PASSWORD_HASH_PARALLELISM", 4)),
+		KeyLen:      envU32("PASSWORD_HASH_KEYLEN", 32),
+	}
+}
+
+func HashPassword(plain string) (string, error) {
+	p := paramsFromEnv()
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	sum := argon2.IDKey([]byte(plain), salt, p.Iterations, p.Memory, p.Parallelism, p.KeyLen)
+	enc := "argon2id$" +
+		strconv.Itoa(int(p.Memory)) + "$" +
+		strconv.Itoa(int(p.Iterations)) + "$" +
+		strconv.Itoa(int(p.Parallelism)) + "$" +
+		base64.RawStdEncoding.EncodeToString(salt) + "$" +
+		base64.RawStdEncoding.EncodeToString(sum)
+	return enc, nil
+}
+
+func VerifyPassword(plain, encoded string) (bool, error) {
+	var mem, iters, par int
+	var saltB64, sumB64 string
+	_, err := fmtSscanf(encoded, "argon2id$%d$%d$%d$%s$%s", &mem, &iters, &par, &saltB64, &sumB64)
+	if err != nil {
+		return false, errors.New("bad hash format")
+	}
+	salt, err := base64.RawStdEncoding.DecodeString(saltB64)
+	if err != nil {
+		return false, err
+	}
+	sum, err := base64.RawStdEncoding.DecodeString(sumB64)
+	if err != nil {
+		return false, err
+	}
+	keyLen := uint32(len(sum))
+	out := argon2.IDKey([]byte(plain), salt, uint32(iters), uint32(mem), uint8(par), keyLen)
+	if len(out) != len(sum) {
+		return false, nil
+	}
+	// constant-time compare
+	var diff uint8
+	for i := range out {
+		diff |= out[i] ^ sum[i]
+	}
+	return diff == 0, nil
+}
+
+// tiny wrapper so we don't import fmt just for Sscanf
+func fmtSscanf(s, f string, a ...any) (int, error) {
+	type scan interface {
+		Scan(string, string, ...any) (int, error)
+	}
+	var _scan scan = (fmtScan)(0)
+	return _scan.Scan(s, f, a...)
+}
+type fmtScan int
+func (fmtScan) Scan(s, f string, a ...any) (int, error) {
+	return fmtSscanfReal(s, f, a...)
+}
+
+//go:build !js
+// +build !js
+
+// split into separate function to avoid linter noise
+func fmtSscanfReal(s, f string, a ...any) (int, error) {
+	return fmtSscanfStd(s, f, a...)
 }
