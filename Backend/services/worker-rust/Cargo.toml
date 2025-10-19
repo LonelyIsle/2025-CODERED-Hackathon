@@ -26,3 +26,4 @@ sitemap = "0.4.1"           # sitemap.xml discover
 sha2 = "0.10"             # content hashing
 whatlang = "0.16"         # language detection
 dashmap = "6"             # concurrent robots cache
+xml-rs = "=0.8.14"
