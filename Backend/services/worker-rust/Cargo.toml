@@ -21,9 +21,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 bytes = "1.6"
 
-# NEW:
 feed-rs = "1.3"           # RSS/Atom discover
-sitemap = "0.6"           # sitemap.xml discover
+sitemap = "0.4.1"           # sitemap.xml discover
 sha2 = "0.10"             # content hashing
 whatlang = "0.16"         # language detection
 dashmap = "6"             # concurrent robots cache
