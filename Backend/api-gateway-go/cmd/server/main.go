@@ -115,8 +115,18 @@ r.Route("/api", func(api chi.Router) {
 	if port == "" {
 		port = "8081"
 	}
+
+	// 👉 Dump all routes on startup so you can verify /api/auth/login exists
+    if err := chi.Walk(r, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+        log.Printf("route %-6s %s", method, route)
+        return nil
+    }); err != nil {
+        log.Printf("chi.Walk error: %v", err)
+    }
+
 	log.Printf("🌍 API Gateway running on :%s", port)
 	if err := http.ListenAndServe(":"+port, r); err != nil {
 		log.Fatalf("❌ Failed to start server: %v", err)
+
 	}
 }
