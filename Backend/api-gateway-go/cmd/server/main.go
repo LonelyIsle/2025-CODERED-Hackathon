@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -14,71 +16,104 @@ import (
 	"github.com/LonelyIsle/2025-CODERED-Hackathon/Backend/api-gateway-go/internal/db"
 	"github.com/LonelyIsle/2025-CODERED-Hackathon/Backend/api-gateway-go/internal/handlers"
 	"github.com/LonelyIsle/2025-CODERED-Hackathon/Backend/api-gateway-go/internal/security"
-    "github.com/your-org/2025-CODERED-Hackathon/Backend/api-gateway-go/internal/handlers"
 )
-)
+
+// --- CSRF helpers (public endpoint) ------------------------------------------------------
+
+func newCSRFToken() string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 32)
+	for i := range b {
+		b[i] = letters[time.Now().UnixNano()%int64(len(letters))]
+	}
+	return string(b)
+}
+
+func csrfHandler(w http.ResponseWriter, r *http.Request) {
+	token := newCSRFToken()
+	http.SetCookie(w, &http.Cookie{
+		Name:     "csrf",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: false, // frontend JS must echo it in X-CSRF-Token
+		SameSite: http.SameSiteLaxMode,
+		Secure:   false, // set true when served behind HTTPS
+	})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"csrf": token})
+}
+
+// --- tiny sanity route -------------------------------------------------------------------
+
+func pingHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("pong"))
+}
 
 func main() {
-	// ==============================================
-	// 🔧 Load environment variables
-	// ==============================================
-	if err := godotenv.Load("../.env"); err != nil {
-		log.Println("⚠️  No .env file found, relying on system environment variables")
-	}
+	// Load env (works when running from api-gateway-go or repo root)
+	_ = godotenv.Load(".env")
+	_ = godotenv.Load("../.env") // fallback if binary runs from /api-gateway-go
 
-	// ==============================================
-	// 🧠 Initialize core subsystems
-	// ==============================================
+	// init subsystems
 	db.Init()
 	cache.Init()
 
-	// ==============================================
-	// 🚦 Setup Router
-	// ==============================================
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
-	r.Use(security.CSRFMiddleware)
-	r.Use(security.RateLimitMiddleware)
+	r.Use(middleware.Recoverer)
 
-	// ==============================================
-	// 🔐 Authentication routes
-	// ==============================================
-	r.Post("/api/auth/login", auth.Login)
-	r.Post("/api/auth/logout", auth.Logout)
-	r.Get("/api/auth/me", func(w http.ResponseWriter, req *http.Request) {
-		// RequireAuth returns http.Handler; adapt to HandlerFunc
-		auth.RequireAuth(http.HandlerFunc(auth.Me)).ServeHTTP(w, req)
-	})
+// ---------- Public routes (NO CSRF) ----------
+r.Route("/api/auth", func(pub chi.Router) {
+    pub.Get("/csrf", csrfHandler)
+})
 
-	// ==============================================
-	// 📊 Report routes
-	// ==============================================
-	r.Post("/api/report", func(w http.ResponseWriter, req *http.Request) {
-		auth.RequireAuth(http.HandlerFunc(handlers.GenerateReport)).ServeHTTP(w, req)
-	})
+// ---------- Protected API (CSRF + rate limit) ----------
+r.Route("/api", func(api chi.Router) {
+    api.Use(security.CSRFMiddleware)
+    api.Use(security.RateLimitMiddleware)
 
-	// ==============================================
-	// 🧰 Admin routes
-	// ==============================================
-	r.Get("/api/admin", func(w http.ResponseWriter, req *http.Request) {
-		auth.RequireAuth(http.HandlerFunc(handlers.AdminDashboard)).ServeHTTP(w, req)
-	})
-	// Trigger worker scraper via API Gateway
-	r.Post("/api/admin/ingest", func(w http.ResponseWriter, req *http.Request) {
-    	auth.RequireAuth(http.HandlerFunc(handlers.IngestURL)).ServeHTTP(w, req)
-	})
+    // health/ping
+    api.Get("/ping", pingHandler)
 
-	// ==============================================
-	// 🌐 Serve static frontend (optional)
-	// ==============================================
-	r.Handle("/*", http.FileServer(http.Dir("./web")))
+    // Auth-only endpoints
+    api.Route("/auth", func(a chi.Router) {
+        a.Post("/login", auth.Login)   // expects X-CSRF-Token + csrf cookie
+        a.Post("/logout", auth.Logout)
+        a.Get("/me", func(w http.ResponseWriter, req *http.Request) {
+            auth.RequireAuth(http.HandlerFunc(auth.Me)).ServeHTTP(w, req)
+        })
+    })
 
-	// ==============================================
-	// 🚀 Start server
-	// ==============================================
+    // AI endpoints (protect or not—your call; here they’re protected)
+    api.Post("/ai/chat", func(w http.ResponseWriter, req *http.Request) {
+        auth.RequireAuth(http.HandlerFunc(handlers.ChatHandler)).ServeHTTP(w, req)
+    })
+    api.Post("/ai/embed", func(w http.ResponseWriter, req *http.Request) {
+        auth.RequireAuth(http.HandlerFunc(handlers.EmbedHandler)).ServeHTTP(w, req)
+    })
+
+    // Reports/Admin
+    api.Post("/report", func(w http.ResponseWriter, req *http.Request) {
+        auth.RequireAuth(http.HandlerFunc(handlers.GenerateReport)).ServeHTTP(w, req)
+    })
+    api.Get("/admin", func(w http.ResponseWriter, req *http.Request) {
+        auth.RequireAuth(http.HandlerFunc(handlers.AdminDashboard)).ServeHTTP(w, req)
+    })
+    api.Post("/admin/ingest", func(w http.ResponseWriter, req *http.Request) {
+        auth.RequireAuth(http.HandlerFunc(handlers.IngestURL)).ServeHTTP(w, req)
+    })
+})
+
+	// (Optional) static fallback if you ever serve frontend from the Go binary.
+	// Nginx is serving your dist already, so you can remove this if unused.
+	// r.Handle("/*", http.FileServer(http.Dir("./web")))
+
 	port := os.Getenv("API_PORT")
 	if port == "" {
-		port = "8080"
+		port = "8081"
 	}
 	log.Printf("🌍 API Gateway running on :%s", port)
 	if err := http.ListenAndServe(":"+port, r); err != nil {
