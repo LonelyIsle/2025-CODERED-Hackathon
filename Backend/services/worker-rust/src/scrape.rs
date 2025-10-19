@@ -1,11 +1,15 @@
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use chrono::Utc;
-use reqwest::{redirect::Policy, Client, StatusCode};
+use reqwest::{header, redirect::Policy, Client, StatusCode};
 use scraper::{Html, Selector};
+use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use url::Url;
+use whatlang::detect;
+
+use crate::types::Document;
 
 #[derive(Clone)]
 pub struct ScrapeClient {
@@ -36,41 +40,48 @@ impl ScrapeClient {
         }
     }
 
-    pub async fn fetch_bytes(&self, url: &Url) -> Result<(StatusCode, String, Bytes)> {
+    pub async fn fetch_bytes(&self, url: &Url) -> Result<(StatusCode, String, Option<String>, Bytes)> {
         let _permit = self.domain_limit.acquire().await?;
         tokio::time::sleep(self.delay).await;
 
         let res = self.http.get(url.clone()).send().await?;
         let status = res.status();
+
         let ct = res
             .headers()
-            .get(reqwest::header::CONTENT_TYPE)
+            .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+
+        let etag = res
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
         let body = res.bytes().await?;
-        Ok((status, ct, body))
+        Ok((status, ct, etag, body))
     }
 }
 
 /// Minimal robots.txt check:
 /// - fetches /robots.txt (if present)
-/// - chooses the first matching User-agent group (exact UA substring match, else `*`)
-/// - applies Disallow prefixes (Allow with longer prefix overrides)
+/// - picks UA-specific group (substring match) or `*`
+/// - Disallow prefixes block unless a longer Allow overrides
 async fn allowed_by_robots(sc: &ScrapeClient, url: &Url) -> bool {
-    // Build robots.txt URL (http[s]://host[:port]/robots.txt)
-    let mut robots = url.clone();
-    robots.set_path("/robots.txt");
-    robots.set_query(None);
-    robots.set_fragment(None);
+    let mut robots_url = url.clone();
+    robots_url.set_path("/robots.txt");
+    robots_url.set_query(None);
+    robots_url.set_fragment(None);
 
-    let txt = match sc.http.get(robots).send().await {
+    let txt = match sc.http.get(robots_url).send().await {
         Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
         _ => None,
     };
     let txt = match txt {
         Some(t) => t,
-        None => return true, // no robots -> allow
+        None => return true,
     };
 
     #[derive(Default)]
@@ -80,35 +91,45 @@ async fn allowed_by_robots(sc: &ScrapeClient, url: &Url) -> bool {
         allow: Vec<String>,
     }
 
-    // Parse into groups
-    let mut groups: Vec<Group> = Vec::new();
+    // Parse simple robots format
+    let mut groups = Vec::<Group>::new();
     let mut current = Group::default();
-    let mut saw = false;
+    let mut saw_any = false;
 
     for raw in txt.lines() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         let mut parts = line.splitn(2, ':');
-        let k = parts.next().unwrap().trim().to_ascii_lowercase();
-        let v = parts.next().unwrap_or("").trim().to_string();
+        let key = parts.next().unwrap().trim().to_ascii_lowercase();
+        let val = parts.next().unwrap_or("").trim().to_string();
 
-        match k.as_str() {
+        match key.as_str() {
             "user-agent" => {
-                if saw && (!current.uas.is_empty() || !current.disallow.is_empty() || !current.allow.is_empty()) {
+                if saw_any && (!current.uas.is_empty() || !current.disallow.is_empty() || !current.allow.is_empty()) {
                     groups.push(current);
                     current = Group::default();
                 }
-                current.uas.push(v.to_ascii_lowercase());
-                saw = true;
+                current.uas.push(val.to_ascii_lowercase());
+                saw_any = true;
             }
-            "disallow" => { current.disallow.push(v); saw = true; }
-            "allow" => { current.allow.push(v); saw = true; }
+            "disallow" => {
+                current.disallow.push(val);
+                saw_any = true;
+            }
+            "allow" => {
+                current.allow.push(val);
+                saw_any = true;
+            }
             _ => {}
         }
     }
-    if saw { groups.push(current); }
+    if saw_any {
+        groups.push(current);
+    }
 
-    // Choose group: exact UA substring match, else `*`
+    // Select group
     let ua_lc = sc.user_agent.to_ascii_lowercase();
     let mut chosen: Option<&Group> = None;
 
@@ -126,15 +147,25 @@ async fn allowed_by_robots(sc: &ScrapeClient, url: &Url) -> bool {
             }
         }
     }
-    let g = match chosen { Some(g) => g, None => return true };
+    let g = match chosen {
+        Some(g) => g,
+        None => return true,
+    };
 
     let path = url.path();
-    // Disallow prefix blocks unless an Allow with a longer prefix overrides.
+
     for d in &g.disallow {
-        if d.is_empty() { continue; }
+        if d.is_empty() {
+            continue;
+        }
         if path.starts_with(d) {
-            let override_ok = g.allow.iter().any(|a| !a.is_empty() && path.starts_with(a) && a.len() > d.len());
-            if !override_ok { return false; }
+            let override_ok = g
+                .allow
+                .iter()
+                .any(|a| !a.is_empty() && path.starts_with(a) && a.len() > d.len());
+            if !override_ok {
+                return false;
+            }
         }
     }
     true
@@ -144,7 +175,7 @@ async fn allowed_by_robots(sc: &ScrapeClient, url: &Url) -> bool {
 fn html_to_text(html: &str) -> (Option<String>, Option<String>, String) {
     let doc = Html::parse_document(html);
 
-    // Title
+    // <title>
     let title_sel = Selector::parse("title").unwrap();
     let title = doc
         .select(&title_sel)
@@ -152,7 +183,7 @@ fn html_to_text(html: &str) -> (Option<String>, Option<String>, String) {
         .map(|n| n.text().collect::<String>().trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Meta description
+    // <meta name="description">
     let meta_sel = Selector::parse("meta[name=description]").unwrap();
     let description = doc
         .select(&meta_sel)
@@ -174,8 +205,6 @@ fn html_to_text(html: &str) -> (Option<String>, Option<String>, String) {
     (title, description, body_text)
 }
 
-use crate::types::Document;
-
 pub async fn scrape_one(sc: &ScrapeClient, url_raw: &str) -> Result<Document> {
     let url = Url::parse(url_raw).map_err(|e| anyhow!("bad url: {e}"))?;
     if !(url.scheme() == "https" || url.scheme() == "http") {
@@ -186,7 +215,7 @@ pub async fn scrape_one(sc: &ScrapeClient, url_raw: &str) -> Result<Document> {
         bail!("blocked by robots.txt");
     }
 
-    let (status, ct, body) = sc.fetch_bytes(&url).await?;
+    let (status, ct, etag, body) = sc.fetch_bytes(&url).await?;
     if !status.is_success() {
         bail!("http status {}", status.as_u16());
     }
@@ -195,9 +224,19 @@ pub async fn scrape_one(sc: &ScrapeClient, url_raw: &str) -> Result<Document> {
         bail!("content-type not html: {ct}");
     }
 
+    // Decode HTML
     let html = String::from_utf8_lossy(&body).to_string();
+
     let (title, description, text) = html_to_text(&html);
     let trimmed = text.chars().take(200_000).collect::<String>();
+
+    // lightweight language guess
+    let lang = detect(&trimmed).map(|i| i.lang().code().to_string());
+
+    // sha256 of body for dedupe
+    let mut hasher = Sha256::new();
+    hasher.update(&body);
+    let hash_hex = format!("{:x}", hasher.finalize());
 
     Ok(Document {
         url: url.to_string(),
@@ -207,5 +246,8 @@ pub async fn scrape_one(sc: &ScrapeClient, url_raw: &str) -> Result<Document> {
         body_text: trimmed,
         content_type: Some(ct),
         http_status: status.as_u16() as i32,
+        content_hash: Some(hash_hex),
+        etag,
+        lang,
     })
 }
