@@ -31,3 +31,7 @@ cookies.txt
 .env
 *.sqlite
 *.db
+
+
+flattener.py
+all_files.txt

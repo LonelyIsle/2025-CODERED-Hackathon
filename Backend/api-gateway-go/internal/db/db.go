@@ -2,33 +2,55 @@ package db
 
 import (
 	"context"
-	"log"
+	"database/sql"
 	"os"
+	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-var Pool *pgxpool.Pool
+var defaultDB *sql.DB
 
-func Init() {
-	url := os.Getenv("PG_URL")
-	if url == "" {
-		log.Fatal("PG_URL not set")
+func Init() error {
+	dsn := os.Getenv("PG_URL")
+	if dsn == "" {
+		dsn = "postgres://climate:climate123@127.0.0.1:5432/codered?sslmode=disable"
 	}
-	cfg, err := pgxpool.ParseConfig(url)
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
-		log.Fatalf("bad PG_URL: %v", err)
+		return err
 	}
-	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
-	if err != nil {
-		log.Fatalf("db connect error: %v", err)
+	db.SetMaxIdleConns(4)
+	db.SetMaxOpenConns(16)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	if err := db.Ping(); err != nil {
+		return err
 	}
-	Pool = pool
-	log.Println("✅ PostgreSQL connected")
+	defaultDB = db
+	return nil
 }
 
-func Close() {
-	if Pool != nil {
-		Pool.Close()
+func DB() *sql.DB { return defaultDB }
+
+type User struct {
+	ID           int64
+	Email        string
+	PasswordHash string
+	Role         string
+}
+
+func GetUserByEmail(ctx context.Context, email string) (*User, error) {
+	const q = `
+		SELECT id, email, password_hash, COALESCE(role,'user')
+		FROM users
+		WHERE email = $1
+		LIMIT 1
+	`
+	var u User
+	err := DB().QueryRowContext(ctx, q, email).
+		Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role)
+	if err != nil {
+		return nil, err
 	}
+	return &u, nil
 }
