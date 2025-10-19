@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use deadpool_postgres::{Manager, ManagerConfig, RecyclingMethod, Pool};
 use tokio_postgres::NoTls;
+use std::str::FromStr; // <- needed for Config::from_str
 
 pub type PgPool = Pool;
 
@@ -36,7 +37,8 @@ pub async fn ensure_tables(pool: &PgPool) -> Result<()> {
       content_hash  text,
       lang          text,
       etag          text,
-      created_at    timestamptz NOT NULL DEFAULT now()
+      created_at    timestamptz NOT NULL DEFAULT now(),
+      updated_at    timestamptz NOT NULL DEFAULT now()   -- <- needed by UPSERT
     );
     CREATE INDEX IF NOT EXISTS idx_ingested_fetched_at
       ON public.ingested_documents (fetched_at DESC);
@@ -131,7 +133,8 @@ pub async fn enqueue_many(pool: &PgPool, items: &[(&str, i32)]) -> Result<usize>
             INSERT INTO public.crawl_queue (url, priority)
             VALUES ($1, $2)
             ON CONFLICT (url) DO UPDATE
-            SET priority = GREATEST(crawl_queue.priority, EXCLUDED.priority)
+            SET priority = GREATEST(crawl_queue.priority, EXCLUDED.priority),
+                updated_at = now()
             "#,
             &[url, prio],
         ).await?;
@@ -141,7 +144,7 @@ pub async fn enqueue_many(pool: &PgPool, items: &[(&str, i32)]) -> Result<usize>
 }
 
 pub async fn dequeue_due(pool: &PgPool, batch: i64) -> Result<Vec<QueueItem>> {
-    let client = pool.get().await?;
+    let mut client = pool.get().await?;       // <- must be mutable for build_transaction()
     let tx = client.build_transaction().start().await?;
     let rows = tx.query(
         r#"
@@ -168,11 +171,11 @@ pub async fn reschedule_success(pool: &PgPool, id: i64, http_status: i32) -> Res
     client.execute(
         r#"
         UPDATE public.crawl_queue
-        SET last_status = $2,
-            last_error  = NULL,
-            tries       = 0,
+        SET last_status   = $2,
+            last_error    = NULL,
+            tries         = 0,
             next_fetch_at = now() + interval '6 hours',
-            updated_at  = now()
+            updated_at    = now()
         WHERE id = $1
         "#,
         &[&id, &http_status],
@@ -185,11 +188,11 @@ pub async fn reschedule_failure(pool: &PgPool, id: i64, err: &str, backoff_minut
     client.execute(
         r#"
         UPDATE public.crawl_queue
-        SET last_status = NULL,
-            last_error  = $2,
-            tries       = tries + 1,
+        SET last_status   = NULL,
+            last_error    = $2,
+            tries         = tries + 1,
             next_fetch_at = now() + make_interval(mins := $3),
-            updated_at  = now()
+            updated_at    = now()
         WHERE id = $1
         "#,
         &[&id, &err, &backoff_minutes],
