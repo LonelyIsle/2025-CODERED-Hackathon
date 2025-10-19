@@ -72,7 +72,10 @@ r.Route("/api/auth", func(pub chi.Router) {
 
 // ---------- Protected API (CSRF + rate limit) ----------
 r.Route("/api", func(api chi.Router) {
-    api.Use(security.CSRFMiddleware)
+    // Allow turning off CSRF locally: export DISABLE_CSRF=true
+    if os.Getenv("DISABLE_CSRF") != "true" {
+        api.Use(security.CSRFMiddleware)
+    }
     api.Use(security.RateLimitMiddleware)
 
     // health/ping
