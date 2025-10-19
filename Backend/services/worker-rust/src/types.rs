@@ -18,7 +18,7 @@ pub struct Document {
     pub etag: Option<String>,
     pub lang: Option<String>,
 
-    // Added to align with DB schema
+    // Align with DB schema
     pub last_modified: Option<String>,
 }
 

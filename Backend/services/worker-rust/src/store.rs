@@ -6,8 +6,6 @@ use tokio_postgres::types::ToSql;
 use crate::types::Document;
 
 pub type PgPool = Pool;
-// Re-export Pool so existing imports of `Pool` continue to work.
-pub use deadpool_postgres::Pool as Pool;
 
 pub async fn init_pool(pg_url: &str) -> Result<PgPool> {
     let cfg = pg_url.parse::<tokio_postgres::Config>()?;
@@ -151,7 +149,7 @@ pub async fn mark_backoff(pool: &PgPool, url: &str, minutes: i64) -> Result<()> 
     Ok(())
 }
 
-// -------- Optional helpers mirrored from your snippets (compile-safe) --------
+// -------- Optional helpers (compile-safe stubs) --------
 
 #[derive(Debug)]
 pub struct QueueItem {

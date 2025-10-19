@@ -71,10 +71,7 @@ impl ScrapeClient {
     }
 }
 
-/// Minimal robots.txt check:
-/// - fetches /robots.txt (if present)
-/// - picks UA-specific group (substring match) or `*`
-/// - Disallow prefixes block unless a longer Allow overrides
+/// Minimal robots.txt check
 async fn allowed_by_robots(sc: &ScrapeClient, url: &Url) -> bool {
     let mut robots_url = url.clone();
     robots_url.set_path("/robots.txt");
@@ -83,10 +80,9 @@ async fn allowed_by_robots(sc: &ScrapeClient, url: &Url) -> bool {
 
     let text = match sc.http.get(robots_url).send().await {
         Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
-        _ => return true, // if robots missing/unreadable, allow by default
+        _ => return true,
     };
 
-    // Naive parse: collect allow/disallow rules
     let mut allows: Vec<String> = Vec::new();
     let mut disallows: Vec<String> = Vec::new();
     let ua_l = sc.user_agent.to_lowercase();
@@ -109,27 +105,23 @@ async fn allowed_by_robots(sc: &ScrapeClient, url: &Url) -> bool {
     }
 
     let p = url.path();
-    // Blocked if a disallow matches and no longer allow overrides
     let blocked = disallows.iter().any(|d| p.starts_with(d)) &&
-                  !allows.iter().any(|a| p.starts_with(a) && a.len() > 0);
+                  !allows.iter().any(|a| p.starts_with(a) && !a.is_empty());
     !blocked
 }
 
 fn html_to_text(html: &str) -> (Option<String>, Option<String>, String) {
     let doc = Html::parse_document(html);
 
-    // Title
     let title_sel = Selector::parse("title").unwrap();
     let title = doc.select(&title_sel).next().map(|n| n.text().collect::<String>().trim().to_string()).filter(|s| !s.is_empty());
 
-    // Meta description
     let meta_desc_sel = Selector::parse("meta[name=\"description\"]").unwrap();
     let description = doc.select(&meta_desc_sel).next()
         .and_then(|n| n.value().attr("content"))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Body visible text (simple heuristic)
     let body_sel = Selector::parse("body").unwrap();
     let body_text = doc
         .select(&body_sel)
@@ -161,16 +153,12 @@ pub async fn scrape_one(sc: &ScrapeClient, url_raw: &str) -> Result<Document> {
         bail!("content-type not html: {ct}");
     }
 
-    // Decode HTML
     let html = String::from_utf8_lossy(&body).to_string();
-
     let (title, description, text) = html_to_text(&html);
     let trimmed = text.chars().take(200_000).collect::<String>();
 
-    // lightweight language guess
     let lang = detect(&trimmed).map(|i| i.lang().code().to_string());
 
-    // sha256 of body for dedupe
     let mut hasher = Sha256::new();
     hasher.update(&body);
     let hash_hex = format!("{:x}", hasher.finalize());
