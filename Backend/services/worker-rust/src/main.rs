@@ -50,11 +50,10 @@ async fn ingest_url(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Logging
-    let _ = fmt()
+    // Logging: builder.init() (no trait imports needed)
+    fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-        .finish()
-        .try_init();
+        .init();
 
     // Config from env
     let addr = std::env::var("WORKER_BIND").unwrap_or_else(|_| "127.0.0.1:5002".to_string());
