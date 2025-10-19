@@ -17,15 +17,11 @@ func Init() error {
 		dsn = "postgres://climate:climate123@127.0.0.1:5432/codered?sslmode=disable"
 	}
 	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 	db.SetMaxIdleConns(4)
 	db.SetMaxOpenConns(16)
 	db.SetConnMaxIdleTime(5 * time.Minute)
-	if err := db.Ping(); err != nil {
-		return err
-	}
+	if err := db.Ping(); err != nil { return err }
 	defaultDB = db
 	return nil
 }
@@ -49,8 +45,6 @@ func GetUserByEmail(ctx context.Context, email string) (*User, error) {
 	var u User
 	err := DB().QueryRowContext(ctx, q, email).
 		Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 	return &u, nil
 }

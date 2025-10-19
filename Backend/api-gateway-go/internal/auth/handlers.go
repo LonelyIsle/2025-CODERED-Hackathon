@@ -34,14 +34,12 @@ func Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ttlH := 24
+	ttl := 24 * time.Hour
 	if v := os.Getenv("SESSION_TTL_HOURS"); v != "" {
-		if n, _ := time.ParseDuration(v + "h"); n > 0 {
-			ttlH = int(n.Hours())
-		}
+		if n, _ := time.ParseDuration(v + "h"); n > 0 { ttl = n }
 	}
 	token := uuid.NewString()
-	if err := cache.Set("sess:"+token, u.Email, time.Duration(ttlH)*time.Hour); err != nil {
+	if err := cache.Set("sess:"+token, u.Email, ttl); err != nil {
 		http.Error(w, "session store failed", http.StatusInternalServerError)
 		return
 	}
@@ -52,15 +50,13 @@ func Login(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		// Secure: true, // enable if behind HTTPS only
 	})
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"ok":true}`))
 }
 
 func Logout(w http.ResponseWriter, r *http.Request) {
-	c, err := r.Cookie(sessionCookie)
-	if err == nil && c.Value != "" {
+	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
 		_ = cache.Delete("sess:" + c.Value)
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -71,24 +67,18 @@ func Logout(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"ok":true}`))
 }
 
 func Me(w http.ResponseWriter, r *http.Request) {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil || c.Value == "" {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+		http.Error(w, "unauthorized", http.StatusUnauthorized); return
 	}
 	email, err := cache.Get("sess:" + c.Value)
 	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+		http.Error(w, "unauthorized", http.StatusUnauthorized); return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok":    true,
-		"email": email,
-	})
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "email": email})
 }
