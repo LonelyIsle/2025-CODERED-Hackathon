@@ -1,7 +1,7 @@
+// src/main.rs
 use actix_web::{middleware, post, get, web, App, HttpResponse, HttpServer, Responder};
 use tracing::{error, info};
-use tracing_subscriber::{EnvFilter, fmt};
-use std::time::Duration;
+use tracing_subscriber::{fmt, EnvFilter};
 
 mod scrape;
 mod store;
@@ -24,10 +24,10 @@ async fn ingest_url(
 ) -> actix_web::Result<impl Responder> {
     let req = payload.into_inner();
 
-    match scrape_one(sc.get_ref(), &req.url).await {
+    match scrape_one(&sc, &req.url).await {
         Ok(doc) => {
-            if let Err(e) = store::upsert_document(pg.get_ref(), &doc).await {
-                error!(error = ?e, "failed to store document");
+            if let Err(e) = store::upsert_document(&pg, &doc).await {
+                error!(error=?e, "failed to store document");
                 return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                     "ok": false, "error": "store_failed"
                 })));
@@ -40,7 +40,7 @@ async fn ingest_url(
             })))
         }
         Err(e) => {
-            error!(error = ?e, "scrape failed");
+            error!(error=?e, "scrape failed");
             Ok(HttpResponse::BadRequest().json(serde_json::json!({
                 "ok": false, "error": e.to_string()
             })))
@@ -50,12 +50,13 @@ async fn ingest_url(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Logging: builder.init() (no trait imports needed)
-    fmt()
+    // Logging
+    let _ = fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-        .init();
+        .finish()
+        .try_init();
 
-    // Config from env
+    // Config
     let addr = std::env::var("WORKER_BIND").unwrap_or_else(|_| "127.0.0.1:5002".to_string());
     let pg_url = std::env::var("PG_URL").expect("PG_URL not set");
 
@@ -63,16 +64,10 @@ async fn main() -> std::io::Result<()> {
     let pool = init_pool(&pg_url).await.expect("pg pool init failed");
     info!("✅ connected to Postgres");
 
-    // (Optional) ensure tables exist
-    if let Err(e) = store::ensure_tables(&pool).await {
-        eprintln!("warning: failed to ensure tables: {e}");
-    }
-
-    // polite concurrency: 2 per domain, 400ms delay
     let sc = ScrapeClient::new(
         "ClimateImpactBot/1.0 (+https://codered.plobethus.com)",
         2,
-        Duration::from_millis(400),
+        std::time::Duration::from_millis(400),
     );
 
     info!("🌐 worker listening on {}", addr);
