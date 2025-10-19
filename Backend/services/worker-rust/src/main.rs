@@ -54,7 +54,7 @@ async fn main() -> std::io::Result<()> {
     let _ = fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .finish()
-        .try_init();
+        .init();
 
     // Config
     let addr = std::env::var("WORKER_BIND").unwrap_or_else(|_| "127.0.0.1:5002".to_string());
