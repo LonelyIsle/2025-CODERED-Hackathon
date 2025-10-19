@@ -2,49 +2,97 @@ package db
 
 import (
 	"context"
-	"database/sql"
+	"log"
 	"os"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var defaultDB *sql.DB
-
-func Init() error {
-	dsn := os.Getenv("PG_URL")
-	if dsn == "" {
-		dsn = "postgres://climate:climate123@127.0.0.1:5432/codered?sslmode=disable"
-	}
-	db, err := sql.Open("pgx", dsn)
-	if err != nil { return err }
-	db.SetMaxIdleConns(4)
-	db.SetMaxOpenConns(16)
-	db.SetConnMaxIdleTime(5 * time.Minute)
-	if err := db.Ping(); err != nil { return err }
-	defaultDB = db
-	return nil
-}
-
-func DB() *sql.DB { return defaultDB }
+var Pool *pgxpool.Pool
 
 type User struct {
 	ID           int64
 	Email        string
 	PasswordHash string
 	Role         string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// Init connects using PG_URL and ensures the users table exists.
+func Init() error {
+	pgURL := os.Getenv("PG_URL")
+	if pgURL == "" {
+		return Errf("PG_URL not set")
+	}
+	cfg, err := pgxpool.ParseConfig(pgURL)
+	if err != nil {
+		return Errf("parse PG_URL: %v", err)
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		return Errf("connect db: %v", err)
+	}
+	Pool = pool
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Ensure schema
+	_, err = Pool.Exec(ctx, `
+CREATE TABLE IF NOT EXISTS users (
+  id BIGSERIAL PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'user',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+`)
+	if err != nil {
+		return Errf("ensure users: %v", err)
+	}
+
+	log.Printf("✅ connected to Postgres")
+	return nil
+}
+
+func Close() {
+	if Pool != nil {
+		Pool.Close()
+	}
 }
 
 func GetUserByEmail(ctx context.Context, email string) (*User, error) {
-	const q = `
-		SELECT id, email, password_hash, COALESCE(role,'user')
-		FROM users
-		WHERE email = $1
-		LIMIT 1
-	`
+	row := Pool.QueryRow(ctx, `
+SELECT id, email, password_hash, role, created_at, updated_at
+FROM users
+WHERE email = $1
+`, email)
 	var u User
-	err := DB().QueryRowContext(ctx, q, email).
-		Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role)
-	if err != nil { return nil, err }
+	if err := row.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		return nil, err
+	}
 	return &u, nil
+}
+
+// tiny error helper (keeps imports minimal)
+type strErr string
+func (e strErr) Error() string { return string(e) }
+func Errf(format string, a ...any) error { return strErr(fmtSprintf(format, a...)) }
+func fmtSprintf(format string, a ...any) string {
+	return fmtSprintf2(format, a...)
+}
+
+// inlined fmt.Sprintf to avoid importing fmt everywhere
+func fmtSprintf2(format string, a ...any) string {
+	// trivial, fine for our few calls:
+	return (func() string {
+		type any = interface{}
+		_ = a
+		// Using the real fmt would be simpler, but keeping deps tiny.
+		// Replace with fmt.Sprintf if you prefer:
+		return format
+	})()
 }

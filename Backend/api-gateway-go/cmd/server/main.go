@@ -36,11 +36,7 @@ func main() {
 	})
 
 	// CSRF token endpoint (double submit cookie)
-	r.Get("/api/auth/csrf", func(w http.ResponseWriter, r *http.Request) {
-		token := security.IssueCSRFToken(w)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"token":"` + token + `"}`))
-	})
+r.Get("/api/auth/csrf", security.IssueCSRFToken)
 
 	// auth
 	r.Post("/api/auth/login", auth.Login)
